@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cover Review</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v=app_version) }}">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Cover Review</h1>
+      <p>Validation visuelle des pochettes, avec intégration optionnelle dans les tags.</p>
+    </div>
+    <div class="top-actions">
+      <button id="settingsToggle" class="button secondary">Réglages</button>
+      <button id="scanButton" class="button">Analyser la bibliothèque</button>
+    </div>
+  </header>
+
+  <section id="settingsPanel" class="settings-panel hidden">
+    <form id="settingsForm">
+      <label>
+        Dossier de la bibliothèque
+        <input id="libraryRoot" name="library_root" type="text" placeholder="/chemin/vers/Musique" required>
+      </label>
+      <label>
+        Résolution minimale pour le scan et les propositions
+        <div class="inline-field">
+          <input id="minSize" name="min_size" type="number" min="100" max="10000" value="1000" required>
+          <span>px sur chaque côté</span>
+        </div>
+      </label>
+      <label>
+        Nombre maximal de propositions par recherche
+        <input id="maxCandidates" name="max_candidates" type="number" min="4" max="30" value="16" required>
+      </label>
+      <label>
+        Candidats conservés par album pour la validation en lot
+        <input id="batchCandidates" name="batch_candidates" type="number" min="1" max="8" value="4" required>
+      </label>
+      <label class="checkbox-row">
+        <input id="includeMissing" name="include_missing" type="checkbox" checked>
+        Inclure les albums sans pochette externe ou intégrée
+      </label>
+      <fieldset class="settings-group sources-group">
+        <legend>Sources de recherche</legend>
+        <label class="checkbox-row">
+          <input id="sourceMusicBrainz" name="source_musicbrainz" type="checkbox" checked>
+          MusicBrainz et Cover Art Archive
+        </label>
+        <label class="checkbox-row">
+          <input id="sourceTheAudioDB" name="source_theaudiodb" type="checkbox" checked>
+          TheAudioDB
+        </label>
+        <label class="checkbox-row">
+          <input id="sourceFanart" name="source_fanart" type="checkbox">
+          fanart.tv
+        </label>
+        <label>
+          Clé API de projet fanart.tv
+          <input id="fanartApiKey" name="fanart_api_key" type="password" autocomplete="off" placeholder="Requise pour fanart.tv">
+        </label>
+        <label>
+          Clé personnelle fanart.tv, facultative
+          <input id="fanartClientKey" name="fanart_client_key" type="password" autocomplete="off" placeholder="client_key facultative">
+        </label>
+        <p class="hint">Les clés restent dans la base locale de Cover Review. Aucune clé n’est incluse dans le dépôt.</p>
+      </fieldset>
+      <label class="checkbox-row">
+        <input id="saveExternalCover" name="save_external_cover" type="checkbox" checked>
+        Enregistrer un fichier <code>cover.jpg</code> dans le dossier de l’album
+      </label>
+      <label class="checkbox-row">
+        <input id="embedCover" name="embed_cover" type="checkbox">
+        Intégrer également la pochette dans les fichiers audio
+      </label>
+      <label>
+        Taille maximale de la pochette intégrée
+        <div class="inline-field">
+          <input id="embedMaxSize" name="embed_max_size" type="number" min="300" max="4000" value="1000" required>
+          <span>px sur le côté le plus long</span>
+        </div>
+      </label>
+      <label>
+        Qualité JPEG de la pochette intégrée
+        <div class="inline-field">
+          <input id="embedQuality" name="embed_quality" type="number" min="50" max="95" value="88" required>
+          <span>%</span>
+        </div>
+      </label>
+      <p class="hint settings-hint">L’intégration remplace uniquement la pochette avant pour les MP3, FLAC, Ogg Vorbis et Opus. Pour les fichiers M4A/MP4, le champ de pochette <code>covr</code> est remplacé. Les autres tags sont conservés.</p>
+      <div class="form-actions">
+        <button class="button" type="submit">Enregistrer</button>
+      </div>
+    </form>
+  </section>
+
+  <section id="scanStatus" class="scan-status hidden">
+    <div class="spinner" aria-hidden="true"></div>
+    <div>
+      <strong id="scanMessage">Analyse en cours</strong>
+      <p id="scanDetails"></p>
+    </div>
+  </section>
+
+  <nav class="tabs" aria-label="Navigation">
+    <button class="tab active" data-view="review" data-status="pending">À vérifier <span id="pendingCount">0</span></button>
+    <button class="tab" data-view="batch">Validation en lot <span id="batchReadyCount">0</span></button>
+    <button class="tab" data-view="review" data-status="approved">Validés <span id="approvedCount">0</span></button>
+    <button class="tab" data-view="review" data-status="skipped">Ignorés <span id="skippedCount">0</span></button>
+  </nav>
+
+  <main id="reviewView" class="layout">
+    <aside class="album-sidebar">
+      <div class="sidebar-tools">
+        <input id="albumFilter" type="search" placeholder="Filtrer artiste ou album">
+        <span id="albumPosition">0 / 0</span>
+      </div>
+      <div id="albumList" class="album-list"></div>
+    </aside>
+
+    <section class="review-panel">
+      <div id="emptyState" class="empty-state">
+        <h2>Aucun album sélectionné</h2>
+        <p>Configure le dossier musical, puis lance une analyse.</p>
+      </div>
+
+      <div id="reviewContent" class="hidden">
+        <div class="album-header">
+          <div>
+            <p id="albumArtist" class="eyebrow"></p>
+            <h2 id="albumTitle"></h2>
+            <p id="albumMeta" class="muted"></p>
+            <p id="albumPath" class="path"></p>
+          </div>
+          <div class="header-actions">
+            <button id="undoButton" class="button danger hidden">Annuler la dernière validation</button>
+            <button id="skipButton" class="button secondary">Ignorer</button>
+          </div>
+        </div>
+
+        <div class="comparison">
+          <section class="current-card">
+            <h3>Pochette actuelle</h3>
+            <div class="image-frame current-frame">
+              <img id="currentImage" alt="Pochette actuelle">
+              <div id="currentMissing" class="missing-cover hidden">Aucune pochette trouvée</div>
+            </div>
+            <p id="currentDimensions" class="dimension-label"></p>
+          </section>
+
+          <section class="candidate-section">
+            <div class="candidate-toolbar">
+              <h3>Propositions</h3>
+              <form id="searchForm" class="search-form">
+                <input id="searchArtist" type="text" aria-label="Artiste">
+                <input id="searchAlbum" type="text" aria-label="Album">
+                <button class="button secondary" type="submit">Rechercher</button>
+              </form>
+            </div>
+
+            <div id="candidateLoading" class="loading-box hidden">
+              <div class="spinner" aria-hidden="true"></div>
+              <span>Recherche dans les sources activées</span>
+            </div>
+
+            <div id="candidateMessage" class="notice hidden"></div>
+            <div id="candidateGrid" class="candidate-grid"></div>
+
+            <div id="selectionBar" class="selection-bar hidden">
+              <div>
+                <strong id="selectedLabel"></strong>
+                <span id="selectedDetails"></span>
+              </div>
+              <button id="approveButton" class="button">Utiliser cette image</button>
+            </div>
+          </section>
+        </div>
+
+        <section class="manual-section">
+          <h3>Choix manuel</h3>
+          <div class="manual-grid">
+            <form id="urlForm">
+              <label>
+                URL directe d’une image
+                <div class="inline-submit">
+                  <input id="manualUrl" type="url" placeholder="https://…/cover.jpg">
+                  <button class="button secondary" type="submit">Utiliser l’URL</button>
+                </div>
+              </label>
+            </form>
+            <form id="uploadForm">
+              <label>
+                Image locale
+                <div class="inline-submit">
+                  <input id="manualFile" type="file" accept="image/jpeg,image/png,image/webp">
+                  <button class="button secondary" type="submit">Importer</button>
+                </div>
+              </label>
+            </form>
+          </div>
+          <p class="hint">Les anciennes pochettes externes et intégrées sont sauvegardées dans <code>.cover-review-backups</code>. L’intégration dans les tags dépend des réglages.</p>
+        </section>
+      </div>
+    </section>
+  </main>
+
+
+  <main id="batchView" class="batch-view hidden">
+    <section class="batch-header">
+      <div>
+        <p class="eyebrow">File préparée en arrière-plan</p>
+        <h2>Validation en lot</h2>
+        <p class="muted">Seuls les albums ayant au moins une proposition conforme sont affichés. Le premier candidat est sélectionné et l’album est coché par défaut.</p>
+      </div>
+      <div class="batch-header-actions">
+        <button id="backgroundSearchButton" class="button">Rechercher en arrière-plan</button>
+        <button id="refreshBackgroundSearchButton" class="button secondary">Relancer toutes les recherches</button>
+        <button id="stopBackgroundSearchButton" class="button danger hidden">Arrêter</button>
+      </div>
+    </section>
+
+    <section id="backgroundSearchStatus" class="batch-progress">
+      <div class="batch-progress-line">
+        <strong id="backgroundSearchLabel">Recherche inactive</strong>
+        <span id="backgroundSearchNumbers"></span>
+      </div>
+      <progress id="backgroundSearchProgress" max="1" value="0"></progress>
+      <p id="backgroundSearchCurrent" class="muted"></p>
+      <p id="backgroundSearchCounts" class="muted"></p>
+    </section>
+
+    <section id="batchApplyStatus" class="batch-progress hidden">
+      <div class="batch-progress-line">
+        <strong id="batchApplyLabel">Validation en cours</strong>
+        <span id="batchApplyNumbers"></span>
+      </div>
+      <progress id="batchApplyProgress" max="1" value="0"></progress>
+      <p id="batchApplyCurrent" class="muted"></p>
+    </section>
+
+    <section class="batch-toolbar">
+      <label class="checkbox-row batch-check-all">
+        <input id="batchCheckAll" type="checkbox" checked>
+        Tout cocher
+      </label>
+      <span id="batchSummary" class="muted">Aucun candidat préparé</span>
+      <button id="batchApplyButton" class="button">Valider les pochettes cochées</button>
+    </section>
+
+    <section id="batchEmpty" class="empty-state">
+      <h2>Aucun candidat préparé</h2>
+      <p>Lance la recherche en arrière-plan. Les résultats apparaîtront ici progressivement, sans attendre album par album.</p>
+    </section>
+    <section id="batchList" class="batch-list"></section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <dialog id="imageDialog">
+    <button id="dialogClose" class="dialog-close" aria-label="Fermer">×</button>
+    <img id="dialogImage" alt="Aperçu agrandi">
+    <p id="dialogCaption"></p>
+  </dialog>
+
+  <script>window.COVER_REVIEW_VERSION = {{ app_version|tojson }};</script>
+  <script src="{{ url_for('static', filename='app.js', v=app_version) }}"></script>
+</body>
+</html>
