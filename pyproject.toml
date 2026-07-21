@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cover-review"
+version = "1.5.4"
+description = "Interface Web locale pour repérer les pochettes d'albums trop petites, chercher des remplacements et les valider avant écriture."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "Flask>=3.0,<4",
+    "requests>=2.31,<3",
+    "Pillow>=10",
+    "mutagen>=1.47,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/ncharp/cover-review"
+
+[project.scripts]
+cover-review = "cover_review.app:main"
+
+[tool.setuptools.packages.find]
+include = ["cover_review*"]
+
+[tool.setuptools.package-data]
+cover_review = ["templates/*", "static/*"]

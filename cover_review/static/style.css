@@ -221,7 +221,13 @@ h3 { margin-top: 0; }
   margin-bottom: 13px;
 }
 .candidate-toolbar h3 { margin-bottom: 8px; }
-.search-form { display: grid; grid-template-columns: 180px 230px auto; gap: 8px; }
+.search-form {
+  display: grid;
+  grid-template-columns: minmax(140px, 180px) minmax(180px, 230px) auto auto;
+  gap: 8px;
+}
+.button.bandcamp { background: #3475a9; }
+.notice a { color: var(--accent); }
 .loading-box, .notice {
   display: flex;
   align-items: center;
@@ -258,6 +264,25 @@ h3 { margin-top: 0; }
 .candidate-card.eligible {
   transition: opacity .15s ease;
 }
+
+.candidate-card.filtered-hidden { display: none; }
+.candidate-card.rejected {
+  border-color: #7b5c2d;
+  background: #282116;
+}
+.candidate-card.rejected:hover { border-color: #c48b39; }
+.candidate-card.rejected.selected { border-color: #f0a84a; background: #332717; }
+.candidate-warning {
+  display: none;
+  margin-top: 5px;
+  color: #f0b760;
+  font-size: 12px;
+  font-weight: 700;
+}
+.candidate-card.rejected .candidate-warning { display: block; }
+.notice { flex-wrap: wrap; }
+.notice > span { flex: 1 1 320px; }
+.button.compact { padding: 7px 10px; font-size: 13px; }
 .candidate-number:empty { display: none; }
 .candidate-number {
   position: absolute;
@@ -600,4 +625,8 @@ dialog img { display: block; max-width: 100%; max-height: 78vh; margin: auto; ob
 
 @media (max-width: 900px) {
   .settings-group { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 900px) {
+  .search-form { grid-template-columns: 1fr 1fr; }
 }

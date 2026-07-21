@@ -1,21 +1,28 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import hashlib
 import io
 import json
+import logging
 import mimetypes
 import os
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
+import unicodedata
+import webbrowser
 from dataclasses import dataclass
+from html import unescape as html_unescape
+from html.parser import HTMLParser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from flask import Flask, Response, jsonify, render_template, request, send_file
@@ -26,13 +33,21 @@ from mutagen.mp4 import MP4, MP4Cover
 from PIL import Image, ImageFile, ImageOps, UnidentifiedImageError
 
 APP_NAME = "Cover Review"
-APP_VERSION = "1.3.0"
-SEARCH_CACHE_VERSION = 4
-BATCH_RESULT_VERSION = 2
-DATA_DIR = Path(os.environ.get("COVER_REVIEW_DATA_DIR", str(Path.home() / ".local" / "share" / "cover-review"))).expanduser()
+APP_VERSION = "1.5.4"
+SEARCH_CACHE_VERSION = 7
+BATCH_RESULT_VERSION = 5
+def _default_data_dir() -> Path:
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        return base / "cover-review"
+    return Path.home() / ".local" / "share" / "cover-review"
+
+
+DATA_DIR = Path(os.environ.get("COVER_REVIEW_DATA_DIR", str(_default_data_dir()))).expanduser()
 CACHE_DIR = DATA_DIR / "cache"
 CURRENT_CACHE_DIR = CACHE_DIR / "current"
 DB_PATH = DATA_DIR / "cover-review.sqlite3"
+LOG_PATH = DATA_DIR / "cover-review.log"
 
 AUDIO_EXTENSIONS = {
     ".mp3", ".flac", ".m4a", ".mp4", ".ogg", ".oga", ".opus",
@@ -51,7 +66,33 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CURRENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-app = Flask(__name__)
+LOGGER = logging.getLogger("cover-review")
+LOGGER.setLevel(logging.INFO)
+if not LOGGER.handlers:
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    file_handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+    LOGGER.addHandler(stream_handler)
+
+BANDCAMP_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
+
+# Dans un exécutable PyInstaller, templates et static sont extraits sous sys._MEIPASS.
+if getattr(sys, "frozen", False):
+    _bundle_dir = Path(getattr(sys, "_MEIPASS", ".")) / "cover_review"
+    app = Flask(
+        __name__,
+        template_folder=str(_bundle_dir / "templates"),
+        static_folder=str(_bundle_dir / "static"),
+    )
+else:
+    app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_DOWNLOAD_BYTES
 
 SCAN_STATE: dict[str, Any] = {
@@ -70,6 +111,8 @@ TADB_LOCK = threading.Lock()
 LAST_TADB_REQUEST = 0.0
 FANART_LOCK = threading.Lock()
 LAST_FANART_REQUEST = 0.0
+BANDCAMP_LOCK = threading.Lock()
+LAST_BANDCAMP_REQUEST = 0.0
 
 BACKGROUND_SEARCH_STATE: dict[str, Any] = {
     "running": False,
@@ -206,6 +249,7 @@ def init_db() -> None:
             "source_musicbrainz": "1",
             "source_theaudiodb": "1",
             "source_fanart": "0",
+            "source_bandcamp": "0",
             "fanart_api_key": "",
             "fanart_client_key": "",
         }
@@ -238,6 +282,7 @@ def update_settings(values: dict[str, Any]) -> dict[str, str]:
         "source_musicbrainz",
         "source_theaudiodb",
         "source_fanart",
+        "source_bandcamp",
         "fanart_api_key",
         "fanart_client_key",
     }
@@ -923,6 +968,758 @@ def search_query_variants(artist: str, album: str) -> list[tuple[str, str]]:
     return variants
 
 
+
+def is_bandcamp_release_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if host != "bandcamp.com" and not host.endswith(".bandcamp.com"):
+        return False
+    return "/album/" in parsed.path or "/track/" in parsed.path
+
+
+def canonical_bandcamp_release_url(url: str) -> str:
+    """Normalize a Bandcamp release URL and remove search tracking parameters."""
+    cleaned = html_unescape((url or "").strip()).replace("\\/", "/")
+    parsed = urlparse(cleaned)
+    if not is_bandcamp_release_url(cleaned):
+        return cleaned
+    return parsed._replace(query="", fragment="").geturl()
+
+
+def bandcamp_art_variant(url: str, size_code: int) -> str:
+    """Return another public Bandcamp artwork size when the URL matches bcbits."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    if not host.endswith("bcbits.com"):
+        return url.replace("http://", "https://")
+    base, separator, query = url.partition("?")
+    converted = re.sub(
+        r"_\d+(?=\.(?:jpe?g|png|webp)$)",
+        f"_{int(size_code)}",
+        base,
+        flags=re.IGNORECASE,
+    )
+    if converted == base:
+        return url.replace("http://", "https://")
+    result = converted + (separator + query if separator else "")
+    return result.replace("http://", "https://")
+
+
+def normalized_match_text(value: str) -> str:
+    """Normalize human-readable metadata for conservative fuzzy matching."""
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.casefold().replace("&", " and ")
+    normalized = re.sub(r"\b(?:feat|featuring|ft)\.?\s+.*$", "", normalized)
+    edition_terms = (
+        r"deluxe|expanded|remaster(?:ed)?|anniversary|special|collector(?:'s)?|"
+        r"limited|bonus(?: tracks?)?|reissue|edition|version"
+    )
+    normalized = re.sub(
+        rf"\s*[\[(][^\])]*(?:{edition_terms})[^\])]*[\])]\s*$",
+        "",
+        normalized,
+    )
+    normalized = re.sub(rf"\s*[-–:]\s*(?:{edition_terms}).*$", "", normalized)
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return compact_spaces(normalized)
+
+
+def metadata_similarity(left: str, right: str) -> float:
+    """Return a forgiving but bounded similarity score between two labels."""
+    a = normalized_match_text(left)
+    b = normalized_match_text(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    sequence = difflib.SequenceMatcher(None, a, b).ratio()
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    token_score = len(a_tokens & b_tokens) / max(1, len(a_tokens | b_tokens))
+    containment = 0.0
+    shorter, longer = sorted((a, b), key=len)
+    if len(shorter) >= 4 and shorter in longer:
+        containment = len(shorter) / len(longer)
+    return max(sequence, token_score, containment)
+
+
+def bandcamp_result_matches(item: dict[str, str], artist: str, album: str) -> bool:
+    """Reject a unique search result when it still looks unrelated."""
+    title = str(item.get("title") or "")
+    result_artist = str(item.get("artist") or "")
+    variants = search_query_variants(artist, album)
+    title_score = max(
+        (metadata_similarity(title, variant_album) for _, variant_album in variants),
+        default=0.0,
+    )
+    artist_score = max(
+        (metadata_similarity(result_artist, variant_artist) for variant_artist, _ in variants),
+        default=0.0,
+    )
+    # Artist can occasionally be missing from a search card. In that case the
+    # title must be almost exact before the result is accepted for review.
+    if not normalized_match_text(result_artist):
+        return title_score >= 0.92
+    return title_score >= 0.78 and artist_score >= 0.70
+
+
+def bandcamp_get(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    attempts: int = 3,
+) -> requests.Response:
+    """Fetch a Bandcamp HTML page conservatively and retry transient failures."""
+    global LAST_BANDCAMP_REQUEST
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    if parsed.scheme != "https" or (host != "bandcamp.com" and not host.endswith(".bandcamp.com")):
+        raise ValueError("URL Bandcamp invalide.")
+
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            LOGGER.info(
+                "Bandcamp GET attempt=%s/%s url=%s params=%s",
+                attempt + 1,
+                max(1, attempts),
+                url,
+                params or {},
+            )
+            with BANDCAMP_LOCK:
+                wait = 0.8 - (time.monotonic() - LAST_BANDCAMP_REQUEST)
+                if wait > 0:
+                    time.sleep(wait)
+                response = requests.get(
+                    url,
+                    params=params,
+                    headers={
+                        "User-Agent": BANDCAMP_USER_AGENT,
+                        "Accept": "text/html,application/xhtml+xml",
+                        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+                        "Connection": "close",
+                    },
+                    timeout=(8, 25),
+                )
+                LAST_BANDCAMP_REQUEST = time.monotonic()
+            body_folded = response.text.casefold()
+            challenged = (
+                "client challenge" in body_folded
+                or "javascript is disabled" in body_folded
+                or "enable javascript" in body_folded
+            )
+            LOGGER.info(
+                "Bandcamp response status=%s final_url=%s bytes=%s challenged=%s",
+                response.status_code,
+                response.url,
+                len(response.content),
+                challenged,
+            )
+            response.raise_for_status()
+            return response
+        except (
+            requests.exceptions.SSLError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.HTTPError,
+        ) as exc:
+            last_error = exc
+            LOGGER.warning(
+                "Bandcamp request failed attempt=%s/%s url=%s error=%r",
+                attempt + 1,
+                max(1, attempts),
+                url,
+                exc,
+            )
+            if attempt + 1 < attempts:
+                time.sleep(0.5 * (2 ** attempt))
+
+    raise requests.RequestException(
+        f"Recherche Bandcamp impossible après {attempts} tentatives : {last_error}"
+    ) from last_error
+
+
+class BandcampSearchParser(HTMLParser):
+    def __init__(self, base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.results: list[dict[str, str]] = []
+        self.current: dict[str, Any] | None = None
+        self.depth = 0
+        self.stack: list[set[str]] = []
+
+    @staticmethod
+    def classes(attrs: dict[str, str]) -> set[str]:
+        return {value for value in attrs.get("class", "").split() if value}
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        attrs = {key: value or "" for key, value in attrs_list}
+        classes = self.classes(attrs)
+        is_result = (
+            (tag == "li" and "searchresult" in classes)
+            or (tag == "article" and "searchresult" in classes)
+            or "search-result" in classes
+        )
+        if self.current is None and is_result:
+            self.current = {
+                "url": "",
+                "title_parts": [],
+                "artist_parts": [],
+                "location_parts": [],
+                "item_type_parts": [],
+                "image_url": "",
+            }
+            self.depth = 1
+            self.stack = [set()]
+
+            # Some Bandcamp variants expose useful metadata directly on the
+            # result container. Keep this deliberately permissive because the
+            # exact attribute names have changed over time.
+            for raw_value in attrs.values():
+                if not raw_value:
+                    continue
+                decoded = html_unescape(raw_value).replace("\\/", "/")
+                for match in re.finditer(
+                    r"https?://[^\s\"'<>]+\.bandcamp\.com/(?:album|track)/[^\s\"'<>]+",
+                    decoded,
+                    flags=re.IGNORECASE,
+                ):
+                    absolute = canonical_bandcamp_release_url(match.group(0))
+                    if is_bandcamp_release_url(absolute):
+                        self.current["url"] = absolute
+                        break
+            return
+        if self.current is None:
+            return
+
+        # Void HTML elements such as <img> do not have a closing tag. They
+        # must not increment the result-card depth, otherwise a real result
+        # card never reaches depth zero and is silently discarded.
+        void_tag = tag in {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }
+        keys: set[str] = set()
+        if "heading" in classes:
+            keys.add("title")
+        if "subhead" in classes:
+            keys.add("artist")
+        if "location" in classes:
+            keys.add("location")
+        if "itemtype" in classes:
+            keys.add("item_type")
+        if not void_tag:
+            self.depth += 1
+            self.stack.append(keys)
+
+        href = attrs.get("href", "").strip()
+        if tag == "a" and href:
+            absolute = urljoin(self.base_url, html_unescape(href))
+            if is_bandcamp_release_url(absolute) and not self.current["url"]:
+                self.current["url"] = canonical_bandcamp_release_url(absolute)
+
+        if tag == "img" and not self.current["image_url"]:
+            source = attrs.get("data-original") or attrs.get("data-src") or attrs.get("src") or ""
+            if source:
+                self.current["image_url"] = urljoin(
+                    self.base_url,
+                    html_unescape(source.strip()),
+                )
+
+    def handle_startendtag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        """Handle XHTML-style void tags without closing the result card.
+
+        ``HTMLParser`` normally calls ``handle_starttag`` followed by
+        ``handle_endtag`` for tags such as ``<img ... />``. Since an image is
+        a void element and does not increase our nesting depth, that default
+        behavior used to close a result card too early.
+        """
+        self.handle_starttag(tag, attrs_list)
+
+    def handle_data(self, data: str) -> None:
+        if self.current is None or not data.strip():
+            return
+        active: set[str] = set()
+        for keys in self.stack:
+            active.update(keys)
+        for key in active:
+            self.current[f"{key}_parts"].append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.current is None:
+            return
+        if tag in {
+            "area", "base", "br", "col", "embed", "hr", "img", "input",
+            "link", "meta", "param", "source", "track", "wbr",
+        }:
+            return
+        self.depth -= 1
+        if self.stack:
+            self.stack.pop()
+        if self.depth > 0:
+            return
+
+        item_type = compact_spaces(" ".join(self.current["item_type_parts"])).casefold()
+        if item_type and not any(value in item_type for value in ("album", "track", "single")):
+            self.current = None
+            self.stack = []
+            return
+        page_url = str(self.current["url"] or "")
+        if page_url:
+            artist = compact_spaces(" ".join(self.current["artist_parts"]))
+            artist = re.sub(r"^by\s+", "", artist, flags=re.IGNORECASE)
+            self.results.append({
+                "url": page_url,
+                "title": compact_spaces(" ".join(self.current["title_parts"])),
+                "artist": artist,
+                "image_url": str(self.current["image_url"] or ""),
+                "location": compact_spaces(" ".join(self.current["location_parts"])),
+            })
+        self.current = None
+        self.stack = []
+
+
+class BandcampReleaseParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.meta: dict[str, str] = {}
+        self.first_art_url = ""
+
+    def handle_starttag(self, tag: str, attrs_list: list[tuple[str, str | None]]) -> None:
+        attrs = {key.casefold(): value or "" for key, value in attrs_list}
+        if tag == "meta":
+            key = (attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or "").casefold()
+            content = attrs.get("content", "").strip()
+            if key and content and key not in self.meta:
+                self.meta[key] = content
+        elif tag == "img" and not self.first_art_url:
+            source = attrs.get("data-original") or attrs.get("data-src") or attrs.get("src") or ""
+            if "bcbits.com/img/" in source:
+                self.first_art_url = source.strip()
+
+
+def fallback_bandcamp_release_links(html_text: str, base_url: str) -> list[dict[str, str]]:
+    """Find release links if Bandcamp changes its result-card class names."""
+    found: list[dict[str, str]] = []
+    seen: set[str] = set()
+    normalized_html = (
+        html_unescape(html_text)
+        .replace("\\/", "/")
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u003A", ":")
+        .replace("\\u003a", ":")
+    )
+    patterns = (
+        r'href\s*=\s*["\']([^"\']+)["\']',
+        r'["\'](?:item_url|itemUrl|url)["\']\s*:\s*["\']([^"\']+)["\']',
+        r'(https?://[^\s"\'<>]+\.bandcamp\.com/(?:album|track)/[^\s"\'<>]+)',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized_html, flags=re.IGNORECASE):
+            raw_url = html_unescape(match.group(1)).replace("\\/", "/")
+            absolute = urljoin(base_url, raw_url)
+            if not is_bandcamp_release_url(absolute):
+                continue
+            page_url = canonical_bandcamp_release_url(absolute)
+            if page_url in seen:
+                continue
+            found.append({
+                "url": page_url,
+                "title": "",
+                "artist": "",
+                "image_url": "",
+                "location": "",
+            })
+            seen.add(page_url)
+    return found
+
+
+def parse_bandcamp_search_html(html_text: str, base_url: str) -> list[dict[str, str]]:
+    """Parse album and track result cards from Bandcamp's public search page."""
+    parser = BandcampSearchParser(base_url)
+    parser.feed(html_text)
+    parser.close()
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+    parsed_items = [*parser.results, *fallback_bandcamp_release_links(html_text, base_url)]
+    for item in parsed_items:
+        page_url = canonical_bandcamp_release_url(item["url"])
+        if page_url in seen:
+            continue
+        item["url"] = page_url
+        results.append(item)
+        seen.add(page_url)
+    return results
+
+
+def parse_bandcamp_release_html(html_text: str, page_url: str) -> dict[str, str]:
+    """Extract cover metadata from one public Bandcamp release page."""
+    parser = BandcampReleaseParser()
+    parser.feed(html_text)
+    parser.close()
+    image_url = (
+        parser.meta.get("og:image")
+        or parser.meta.get("twitter:image")
+        or parser.meta.get("image")
+        or parser.first_art_url
+    )
+    raw_title = compact_spaces(
+        parser.meta.get("og:title", "")
+        or parser.meta.get("twitter:title", "")
+        or parser.meta.get("title", "")
+    )
+    site_name = compact_spaces(parser.meta.get("og:site_name", ""))
+    title = raw_title
+    artist = "" if site_name.casefold() == "bandcamp" else site_name
+
+    # Bandcamp release pages commonly expose ``Album, by Artist`` in
+    # ``og:title``. Split it so metadata matching compares like with like.
+    title_match = re.match(
+        r"^(?P<title>.+?)\s*,\s*(?:by|par|de)\s+(?P<artist>.+?)$",
+        raw_title,
+        flags=re.IGNORECASE,
+    )
+    if title_match:
+        title = compact_spaces(title_match.group("title"))
+        if not artist:
+            artist = compact_spaces(title_match.group("artist"))
+
+    return {
+        "url": page_url,
+        "title": title,
+        "artist": artist,
+        "image_url": urljoin(page_url, image_url) if image_url else "",
+        "location": "",
+    }
+
+
+def bandcamp_slug_variants(value: str, *, join_words: bool = False) -> list[str]:
+    """Return a few conservative Bandcamp-style slug candidates."""
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.casefold().replace("&", " and ")
+    tokens = re.findall(r"[a-z0-9]+", normalized)
+    if not tokens:
+        return []
+
+    values: list[str] = []
+    for candidate in ("-".join(tokens), "".join(tokens) if join_words else ""):
+        candidate = candidate.strip("-")
+        if candidate and candidate not in values:
+            values.append(candidate)
+    return values
+
+
+def bandcamp_direct_release_urls(artist: str, album: str) -> list[str]:
+    """Guess common Bandcamp release URLs without relying on search HTML.
+
+    Bandcamp's public search page can occasionally return an anti-bot or
+    JavaScript challenge to non-browser clients even though the same query
+    works in a normal browser. For straightforward artist and album slugs,
+    probing the expected public release URL is both faster and more reliable.
+    """
+    artist_slugs = bandcamp_slug_variants(artist, join_words=True)
+    album_slugs = bandcamp_slug_variants(album, join_words=True)
+    artist_slugs.sort(key=lambda value: ("-" in value, len(value)))
+    urls: list[str] = []
+    for artist_slug in artist_slugs[:2]:
+        for album_slug in album_slugs[:2]:
+            url = f"https://{artist_slug}.bandcamp.com/album/{album_slug}"
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+def bandcamp_direct_candidate(
+    artist: str,
+    album: str,
+    *,
+    min_size: int,
+) -> dict[str, Any] | None:
+    """Try likely Bandcamp URLs and keep only a matching public release."""
+    guessed_urls = bandcamp_direct_release_urls(artist, album)
+    LOGGER.info(
+        "Bandcamp direct fallback artist=%r album=%r guessed_urls=%s",
+        artist,
+        album,
+        guessed_urls,
+    )
+    for guessed_url in guessed_urls:
+        try:
+            response = bandcamp_get(guessed_url, attempts=1)
+        except (requests.RequestException, ValueError) as exc:
+            LOGGER.info("Bandcamp direct URL rejected url=%s error=%r", guessed_url, exc)
+            continue
+
+        item = parse_bandcamp_release_html(response.text, response.url)
+        title_score = metadata_similarity(str(item.get("title") or ""), album)
+        artist_score = metadata_similarity(str(item.get("artist") or ""), artist)
+        LOGGER.info(
+            "Bandcamp direct parsed requested_url=%s final_url=%s title=%r artist=%r image=%s title_score=%.3f artist_score=%.3f",
+            guessed_url,
+            response.url,
+            item.get("title"),
+            item.get("artist"),
+            bool(item.get("image_url")),
+            title_score,
+            artist_score,
+        )
+        if not item.get("image_url"):
+            continue
+        if not bandcamp_result_matches(item, artist, album):
+            LOGGER.info("Bandcamp direct metadata mismatch url=%s", response.url)
+            continue
+
+        candidate = bandcamp_candidate_from_result(
+            item,
+            fallback_artist=artist,
+            fallback_album=album,
+            min_size=min_size,
+        )
+        if candidate:
+            candidate["source_type"] = "URL Bandcamp déduite"
+            candidate["comment"] = (
+                "Page Bandcamp trouvée directement lorsque la recherche HTML "
+                "n'était pas exploitable"
+            )
+            LOGGER.info(
+                "Bandcamp direct candidate accepted page=%s image=%s",
+                candidate.get("source_url"),
+                candidate.get("download_url"),
+            )
+            return candidate
+    return None
+
+
+def bandcamp_candidate_from_result(
+    item: dict[str, str],
+    *,
+    fallback_artist: str,
+    fallback_album: str,
+    min_size: int,
+) -> dict[str, Any] | None:
+    image_url = str(item.get("image_url") or "").strip()
+    if not image_url:
+        return None
+    preview = image_url.replace("http://", "https://")
+    original = bandcamp_art_variant(preview, 0)
+    download = original if min_size > 1200 else bandcamp_art_variant(preview, 10)
+    page_url = str(item.get("url") or "").strip()
+    title = str(item.get("title") or fallback_album).strip()
+    artist = str(item.get("artist") or fallback_artist).strip()
+    return {
+        "id": hashlib.sha1(f"bandcamp|{page_url}|{download}".encode("utf-8")).hexdigest()[:16],
+        "source": "Bandcamp",
+        "source_type": "résultat Bandcamp",
+        "mbid": "",
+        "title": title,
+        "artist": artist,
+        "date": "",
+        "country": str(item.get("location") or ""),
+        "format": "",
+        "score": None,
+        "preview_url": preview,
+        "download_url": download,
+        "original_url": original,
+        "musicbrainz_url": page_url,
+        "source_url": page_url,
+        "source_link_label": "Bandcamp",
+        "comment": "Recherche Bandcamp lancée manuellement",
+    }
+
+
+def bandcamp_search_candidates(
+    artist: str,
+    album: str,
+    *,
+    min_size: int,
+    limit: int = 12,
+) -> tuple[list[dict[str, Any]], str]:
+    query = compact_spaces(f"{artist} {album}")
+    if not query:
+        return [], "https://bandcamp.com/search"
+    params = {"q": query, "item_type": "a"}
+    search_url = requests.Request(
+        "GET",
+        "https://bandcamp.com/search",
+        params=params,
+    ).prepare().url or "https://bandcamp.com/search"
+    try:
+        response = bandcamp_get(
+            "https://bandcamp.com/search",
+            params=params,
+        )
+        search_url = response.url
+        folded = response.text.casefold()
+        challenged = (
+            "client challenge" in folded
+            or "javascript is disabled" in folded
+            or "enable javascript" in folded
+        )
+        if challenged:
+            LOGGER.info(
+                "Bandcamp search page is a JavaScript challenge; using direct fallback artist=%r album=%r",
+                artist,
+                album,
+            )
+            direct = bandcamp_direct_candidate(artist, album, min_size=min_size)
+            return ([direct] if direct else []), search_url
+        parsed = parse_bandcamp_search_html(response.text, search_url)
+        LOGGER.info(
+            "Bandcamp search parsed artist=%r album=%r result_count=%s",
+            artist,
+            album,
+            len(parsed),
+        )
+    except requests.RequestException:
+        direct = bandcamp_direct_candidate(
+            artist,
+            album,
+            min_size=min_size,
+        )
+        if direct:
+            return [direct], search_url
+        raise
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in parsed[: max(limit * 2, limit)]:
+        if not item.get("image_url"):
+            try:
+                page = bandcamp_get(item["url"], attempts=2)
+                item.update(parse_bandcamp_release_html(page.text, item["url"]))
+            except (requests.RequestException, ValueError):
+                continue
+        candidate = bandcamp_candidate_from_result(
+            item,
+            fallback_artist=artist,
+            fallback_album=album,
+            min_size=min_size,
+        )
+        if candidate is None or candidate["download_url"] in seen:
+            continue
+        candidates.append(candidate)
+        seen.add(candidate["download_url"])
+        if len(candidates) >= limit:
+            break
+
+    if not candidates:
+        direct = bandcamp_direct_candidate(
+            artist,
+            album,
+            min_size=min_size,
+        )
+        if direct:
+            candidates.append(direct)
+    return candidates, search_url
+
+
+def bandcamp_unique_fallback_candidate(
+    artist: str,
+    album: str,
+    *,
+    min_size: int,
+) -> dict[str, Any] | None:
+    """Return a Bandcamp candidate only for one unambiguous album result.
+
+    This is intentionally conservative: it is used by the background search
+    only when the regular providers returned no candidate. The image is still
+    merely preselected for human review and is never written automatically.
+    """
+    query = compact_spaces(f"{artist} {album}")
+    if not query:
+        return None
+    try:
+        response = bandcamp_get(
+            "https://bandcamp.com/search",
+            params={"q": query, "item_type": "a"},
+        )
+        folded = response.text.casefold()
+        challenged = (
+            "client challenge" in folded
+            or "javascript is disabled" in folded
+            or "enable javascript" in folded
+        )
+        if challenged:
+            LOGGER.info(
+                "Bandcamp background search received JavaScript challenge; using direct fallback artist=%r album=%r",
+                artist,
+                album,
+            )
+            return bandcamp_direct_candidate(artist, album, min_size=min_size)
+        parsed = parse_bandcamp_search_html(response.text, response.url)
+    except requests.RequestException:
+        return bandcamp_direct_candidate(
+            artist,
+            album,
+            min_size=min_size,
+        )
+    album_results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in parsed:
+        page_url = str(item.get("url") or "")
+        if "/album/" not in urlparse(page_url).path or page_url in seen_urls:
+            continue
+        seen_urls.add(page_url)
+        album_results.append(item)
+
+    if len(album_results) != 1:
+        return bandcamp_direct_candidate(
+            artist,
+            album,
+            min_size=min_size,
+        )
+
+    item = album_results[0]
+    if not item.get("image_url") or not item.get("title") or not item.get("artist"):
+        page = bandcamp_get(item["url"], attempts=2)
+        page_data = parse_bandcamp_release_html(page.text, page.url)
+        for key, value in page_data.items():
+            if value:
+                item[key] = value
+
+    if not bandcamp_result_matches(item, artist, album):
+        return None
+
+    candidate = bandcamp_candidate_from_result(
+        item,
+        fallback_artist=artist,
+        fallback_album=album,
+        min_size=min_size,
+    )
+    if candidate:
+        candidate["source_type"] = "résultat unique, recours automatique"
+        candidate["comment"] = (
+            "Unique résultat d'album Bandcamp, présélectionné pour validation humaine"
+        )
+    return candidate
+
+
+def resolve_bandcamp_page_candidate(
+    url: str,
+    *,
+    min_size: int,
+    fallback_artist: str = "",
+    fallback_album: str = "",
+) -> dict[str, Any]:
+    if not is_bandcamp_release_url(url):
+        raise ValueError("Cette URL n'est pas une page d'album ou de morceau Bandcamp.")
+    response = bandcamp_get(url)
+    item = parse_bandcamp_release_html(response.text, response.url)
+    candidate = bandcamp_candidate_from_result(
+        item,
+        fallback_artist=fallback_artist,
+        fallback_album=fallback_album,
+        min_size=min_size,
+    )
+    if candidate is None:
+        raise ValueError("Aucune pochette n'a été trouvée sur cette page Bandcamp.")
+    return candidate
+
 def fanart_candidates(
     release_group_id: str,
     *,
@@ -1035,6 +1832,7 @@ def find_candidates(
     use_musicbrainz = settings.get("source_musicbrainz", "1") == "1"
     use_theaudiodb = settings.get("source_theaudiodb", "1") == "1"
     use_fanart = settings.get("source_fanart", "0") == "1"
+    use_bandcamp = settings.get("source_bandcamp", "0") == "1"
     fanart_api_key = settings.get("fanart_api_key", "").strip()
     fanart_client_key = settings.get("fanart_client_key", "").strip()
 
@@ -1240,7 +2038,26 @@ def find_candidates(
             if candidate:
                 break
 
-    active_sources = int(use_musicbrainz) + int(use_theaudiodb) + int(use_fanart and bool(fanart_api_key))
+    # Bandcamp is an intentionally narrow fallback. It is queried only when
+    # all regular sources returned no image, and only one matching album result
+    # is accepted. The candidate remains subject to dimension checking and
+    # explicit human validation in the batch or individual view.
+    if use_bandcamp and not candidates:
+        try:
+            add(bandcamp_unique_fallback_candidate(
+                artist,
+                album,
+                min_size=min_size,
+            ))
+        except (requests.RequestException, ValueError) as exc:
+            network_errors.append(f"Bandcamp : {exc}")
+
+    active_sources = (
+        int(use_musicbrainz)
+        + int(use_theaudiodb)
+        + int(use_fanart and bool(fanart_api_key))
+        + int(use_bandcamp)
+    )
     if not candidates and network_errors and len(network_errors) >= max(1, active_sources):
         raise RuntimeError("Les sources de pochettes sont inaccessibles. " + " ; ".join(network_errors[:3]))
     return candidates[:limit], not network_errors
@@ -1263,6 +2080,7 @@ def cached_candidates(album_row: sqlite3.Row, artist: str, album: str, refresh: 
                 "source_musicbrainz": settings.get("source_musicbrainz", "1"),
                 "source_theaudiodb": settings.get("source_theaudiodb", "1"),
                 "source_fanart": settings.get("source_fanart", "0"),
+                "source_bandcamp": settings.get("source_bandcamp", "0"),
                 "fanart_key": hashlib.sha1(settings.get("fanart_api_key", "").encode("utf-8")).hexdigest()[:12],
                 "fanart_client_key": hashlib.sha1(settings.get("fanart_client_key", "").encode("utf-8")).hexdigest()[:12],
             },
@@ -1308,6 +2126,7 @@ def background_config_key(settings: dict[str, str] | None = None) -> str:
         "source_musicbrainz": settings.get("source_musicbrainz", "1"),
         "source_theaudiodb": settings.get("source_theaudiodb", "1"),
         "source_fanart": settings.get("source_fanart", "0"),
+        "source_bandcamp": settings.get("source_bandcamp", "0"),
         "fanart_key": hashlib.sha1(settings.get("fanart_api_key", "").encode("utf-8")).hexdigest()[:12],
         "fanart_client_key": hashlib.sha1(settings.get("fanart_client_key", "").encode("utf-8")).hexdigest()[:12],
     }
@@ -2339,12 +3158,18 @@ def api_update_settings() -> Response:
         "source_musicbrainz": "1" if payload.get("source_musicbrainz", True) else "0",
         "source_theaudiodb": "1" if payload.get("source_theaudiodb", True) else "0",
         "source_fanart": "1" if payload.get("source_fanart", False) else "0",
+        "source_bandcamp": "1" if payload.get("source_bandcamp", False) else "0",
         "fanart_api_key": str(payload.get("fanart_api_key", "")).strip(),
         "fanart_client_key": str(payload.get("fanart_client_key", "")).strip(),
     }
     if values["source_fanart"] == "1" and not values["fanart_api_key"]:
         return jsonify({"error": "La clé API de projet fanart.tv est requise pour activer cette source."}), 400
-    if values["source_musicbrainz"] == "0" and values["source_theaudiodb"] == "0" and values["source_fanart"] == "0":
+    if (
+        values["source_musicbrainz"] == "0"
+        and values["source_theaudiodb"] == "0"
+        and values["source_fanart"] == "0"
+        and values["source_bandcamp"] == "0"
+    ):
         return jsonify({"error": "Active au moins une source de recherche."}), 400
     if values["save_external_cover"] == "0" and values["embed_cover"] == "0":
         return jsonify({"error": "Active au moins cover.jpg ou l'intégration dans les tags."}), 400
@@ -2468,6 +3293,33 @@ def api_candidates(album_id: str) -> Response:
         return jsonify({"error": str(exc)}), 500
 
 
+@app.get("/api/albums/<album_id>/bandcamp-candidates")
+def api_bandcamp_candidates(album_id: str) -> Response:
+    try:
+        row = get_album_or_404(album_id)
+        artist = request.args.get("artist", row["artist"]).strip()
+        album = request.args.get("album", row["album"]).strip()
+        min_size = max(1, int(get_settings().get("min_size", "1000")))
+        candidates, search_url = bandcamp_search_candidates(
+            artist,
+            album,
+            min_size=min_size,
+            limit=12,
+        )
+        return jsonify({
+            "artist": artist,
+            "album": album,
+            "candidates": candidates,
+            "search_url": search_url,
+        })
+    except KeyError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except (ValueError, requests.RequestException) as exc:
+        return jsonify({"error": str(exc)}), 502
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.post("/api/albums/<album_id>/approve")
 def api_approve(album_id: str) -> Response:
     try:
@@ -2480,9 +3332,26 @@ def api_approve(album_id: str) -> Response:
         if not url:
             raise ValueError("URL manquante.")
 
-        urls = [url]
-        if fallback_url and fallback_url != url:
-            urls.append(fallback_url)
+        source_url = str(payload.get("source_url", "")).strip()
+        settings = get_settings()
+        min_size = max(1, int(settings.get("min_size", "1000")))
+        if is_bandcamp_release_url(url):
+            bandcamp_candidate = resolve_bandcamp_page_candidate(
+                url,
+                min_size=min_size,
+                fallback_artist=row["artist"],
+                fallback_album=row["album"],
+            )
+            urls = [bandcamp_candidate["download_url"]]
+            original_url = bandcamp_candidate.get("original_url") or ""
+            if original_url and original_url not in urls:
+                urls.append(original_url)
+            source = "Bandcamp : page de sortie"
+            source_url = url
+        else:
+            urls = [url]
+            if fallback_url and fallback_url != url:
+                urls.append(fallback_url)
 
         last_error: Exception | None = None
         data: bytes | None = None
@@ -2492,7 +3361,7 @@ def api_approve(album_id: str) -> Response:
                 data = safe_remote_image(candidate_url)
                 selected_url = candidate_url
                 break
-            except requests.RequestException as exc:
+            except (requests.RequestException, ValueError) as exc:
                 last_error = exc
 
         if data is None:
@@ -2501,7 +3370,7 @@ def api_approve(album_id: str) -> Response:
             raise ValueError("Impossible de télécharger l'image.")
 
         result = backup_and_write(
-            row, data, source, selected_url, allow_small=allow_small
+            row, data, source, source_url or selected_url, allow_small=allow_small
         )
         return jsonify({
             "ok": True,
@@ -2703,7 +3572,17 @@ def too_large(_error):
     return jsonify({"error": "Le fichier dépasse 30 Mo."}), 413
 
 
-if __name__ == "__main__":
+def main() -> None:
+    port = int(os.environ.get("COVER_REVIEW_PORT", "5000"))
+    url = f"http://127.0.0.1:{port}"
     print(f"{APP_NAME} {APP_VERSION}")
-    print("Interface : http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    print(f"Interface : {url}")
+    print(f"Journal : {LOG_PATH}")
+    LOGGER.info("Starting %s %s", APP_NAME, APP_VERSION)
+    if not os.environ.get("COVER_REVIEW_NO_BROWSER"):
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+
+
+if __name__ == "__main__":
+    main()

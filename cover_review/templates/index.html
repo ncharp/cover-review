@@ -58,6 +58,10 @@
           <input id="sourceFanart" name="source_fanart" type="checkbox">
           fanart.tv
         </label>
+        <label class="checkbox-row">
+          <input id="sourceBandcamp" name="source_bandcamp" type="checkbox">
+          Bandcamp en recours automatique si la recherche retourne un seul album
+        </label>
         <label>
           Clé API de projet fanart.tv
           <input id="fanartApiKey" name="fanart_api_key" type="password" autocomplete="off" placeholder="Requise pour fanart.tv">
@@ -66,7 +70,7 @@
           Clé personnelle fanart.tv, facultative
           <input id="fanartClientKey" name="fanart_client_key" type="password" autocomplete="off" placeholder="client_key facultative">
         </label>
-        <p class="hint">Les clés restent dans la base locale de Cover Review. Aucune clé n’est incluse dans le dépôt.</p>
+        <p class="hint">Les clés restent dans la base locale de Cover Review. Aucune clé n’est incluse dans le dépôt. L’intégration Bandcamp est expérimentale, limitée et dépend de la structure publique de ses pages.</p>
       </fieldset>
       <label class="checkbox-row">
         <input id="saveExternalCover" name="save_external_cover" type="checkbox" checked>
@@ -158,12 +162,13 @@
                 <input id="searchArtist" type="text" aria-label="Artiste">
                 <input id="searchAlbum" type="text" aria-label="Album">
                 <button class="button secondary" type="submit">Rechercher</button>
+                <button id="bandcampSearchButton" class="button bandcamp" type="button">Bandcamp</button>
               </form>
             </div>
 
             <div id="candidateLoading" class="loading-box hidden">
               <div class="spinner" aria-hidden="true"></div>
-              <span>Recherche dans les sources activées</span>
+              <span id="candidateLoadingText">Recherche dans les sources activées</span>
             </div>
 
             <div id="candidateMessage" class="notice hidden"></div>
@@ -184,9 +189,9 @@
           <div class="manual-grid">
             <form id="urlForm">
               <label>
-                URL directe d’une image
+                URL d’une image ou d’une page Bandcamp
                 <div class="inline-submit">
-                  <input id="manualUrl" type="url" placeholder="https://…/cover.jpg">
+                  <input id="manualUrl" type="url" placeholder="https://…/cover.jpg ou artiste.bandcamp.com/album/…">
                   <button class="button secondary" type="submit">Utiliser l’URL</button>
                 </div>
               </label>
@@ -201,7 +206,7 @@
               </label>
             </form>
           </div>
-          <p class="hint">Les anciennes pochettes externes et intégrées sont sauvegardées dans <code>.cover-review-backups</code>. L’intégration dans les tags dépend des réglages.</p>
+          <p class="hint">Le bouton Bandcamp recherche l’artiste et l’album affichés, puis sélectionne automatiquement le premier résultat conforme. Une URL de page Bandcamp peut aussi être collée directement. Les anciennes pochettes externes et intégrées sont sauvegardées dans <code>.cover-review-backups</code>. L’intégration dans les tags dépend des réglages.</p>
         </section>
       </div>
     </section>

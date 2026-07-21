@@ -2,34 +2,56 @@
 
 Cover Review est une interface Web locale destinée à repérer les pochettes d’albums trop petites, rechercher des images de remplacement et les valider visuellement avant écriture.
 
-## Version 1.3.0
+## Version 1.5.4
 
-Cette version améliore la couverture des recherches :
+Cette version permet d’afficher volontairement les candidats rejetés par le filtre de résolution :
 
-- ajout de fanart.tv, avec clés configurées localement ;
-- recherche MusicBrainz sur des variantes prudentes des titres, par exemple sans suffixe « Deluxe Edition » ou « Remastered » ;
-- choix des sources activables dans les réglages ;
-- invalidation automatique des anciens résultats lorsque les sources ou les clés changent ;
-- aucune clé API ni donnée propre à une machine n’est incluse dans le projet.
+- les propositions trop petites ou dont les dimensions ne peuvent pas être vérifiées restent masquées par défaut ;
+- un bouton permet de les afficher sans modifier le seuil configuré ;
+- chaque carte concernée porte un avertissement visible ;
+- une proposition sous le minimum peut être sélectionnée et enregistrée explicitement, sans confirmation supplémentaire ;
+- les candidats conformes restent sélectionnés automatiquement en priorité.
 
-L’intégration optionnelle des pochettes dans les fichiers audio reste disponible :
+Cette version renforce la détection Bandcamp lorsqu’un résultat visible dans le
+navigateur n’est pas renvoyé correctement au client HTTP de l’application :
 
-- conservation de la grande image sélectionnée dans `cover.jpg` ;
-- création d’une version JPEG séparée pour les tags ;
-- taille maximale intégrée configurable, 1000 px par défaut ;
-- qualité JPEG configurable, 88 par défaut ;
-- remplacement de la pochette avant uniquement lorsque le format le permet ;
-- sauvegarde des anciennes pochettes externes et intégrées ;
-- restauration via l’action d’annulation ;
-- aucun chemin propre à une machine ou à un utilisateur n’est inclus dans le projet.
+- correction des balises autofermantes comme `<img />`, qui pouvaient terminer une carte trop tôt ;
+- lecture des URL éventuellement présentes dans les attributs de la carte de résultat ;
+- détection supplémentaire des URL échappées dans le HTML ou dans des blocs de données ;
+- séparation correcte des métadonnées Bandcamp du type `Album, by Artist` ;
+- recours direct à quelques URL Bandcamp probables lorsque la page de recherche renvoie un défi JavaScript ou un HTML inexploitable ;
+- invalidation des anciens résultats vides de la recherche en arrière-plan.
 
-La recherche et la validation en lot restent disponibles :
+Le recours Bandcamp facultatif reste disponible dans la recherche en arrière-plan :
 
-- recherches en arrière-plan ;
-- affichage uniquement des albums ayant au moins un candidat conforme ;
-- premier candidat sélectionné par défaut ;
-- validation groupée des albums cochés ;
-- réutilisation des résultats préparés dans la vue individuelle.
+- Bandcamp n’est interrogé que lorsque les sources régulières n’ont fourni aucun candidat ;
+- le résultat n’est conservé que si la recherche retourne exactement une page d’album ;
+- l’artiste et le titre sont comparés de façon conservatrice aux métadonnées locales ;
+- la pochette reste présélectionnée pour validation humaine, jamais appliquée automatiquement ;
+- les requêtes sont séquentielles, espacées et mises en cache avec les autres résultats.
+
+La recherche Bandcamp manuelle reste disponible :
+
+- bouton **Bandcamp** dans la vue individuelle ;
+- recherche préremplie avec l’artiste et l’album affichés ;
+- résultats présentés comme les autres candidats ;
+- premier candidat conforme sélectionné automatiquement ;
+- lien vers la recherche Bandcamp dans le navigateur lorsqu’aucun résultat exploitable n’est trouvé ;
+- possibilité de coller directement l’URL d’une page d’album ou de morceau Bandcamp ;
+- récupération de la version 1200 px ou de l’image originale selon la résolution minimale configurée.
+
+Bandcamp ne fournit pas d’API publique de recherche de catalogue adaptée à cet usage. Cette intégration lit donc de manière limitée les pages publiques de recherche et de sortie. Elle peut cesser de fonctionner si la structure du site change.
+
+Les fonctions ajoutées dans les versions précédentes restent disponibles :
+
+- MusicBrainz et Cover Art Archive ;
+- TheAudioDB ;
+- fanart.tv avec clé configurée localement ;
+- variantes prudentes de recherche ;
+- recherche et validation en lot ;
+- création de `cover.jpg` ;
+- intégration optionnelle dans les tags audio ;
+- sauvegarde et annulation.
 
 ## Formats pris en charge pour l’intégration
 
@@ -53,27 +75,69 @@ Les autres formats audio restent utilisables dans la bibliothèque, mais leur po
 
 Il reste conseillé de disposer d’une sauvegarde normale de la bibliothèque avant toute modification massive de fichiers audio.
 
-## Installation
+## Installation et lancement
+
+### Exécutable prêt à l'emploi (aucune installation)
+
+Des exécutables Windows, Linux et macOS sont construits automatiquement à chaque release et proposés sur la [page Releases](https://github.com/ncharp/cover-review/releases). Télécharger le fichier correspondant au système puis le lancer : le navigateur s'ouvre automatiquement sur l'interface.
+
+Les binaires ne sont pas signés. Windows SmartScreen ou macOS Gatekeeper peuvent afficher un avertissement au premier lancement.
+
+Les méthodes suivantes demandent Python 3.9 ou plus récent.
+
+### Avec pipx
 
 ```bash
+pipx install git+https://github.com/ncharp/cover-review.git
+cover-review
+```
+
+pipx s'installe avec `sudo apt install pipx` sur Debian et Ubuntu, ou `brew install pipx` sur macOS.
+
+### Avec uv, sans installation
+
+```bash
+uvx --from git+https://github.com/ncharp/cover-review cover-review
+```
+
+### Depuis les sources
+
+```bash
+git clone https://github.com/ncharp/cover-review.git
 cd cover-review
-./install.sh
 ./run.sh
 ```
 
-Ouvrir ensuite : `http://127.0.0.1:5000`
+Le premier lancement crée automatiquement l'environnement Python et installe les dépendances. Les lancements suivants démarrent directement. Le module `venv` est requis (paquet `python3-venv` sur Debian et Ubuntu).
+
+### Au lancement
+
+Le navigateur s'ouvre automatiquement sur `http://127.0.0.1:5000`. Deux variables d'environnement permettent d'ajuster ce comportement :
+
+```bash
+COVER_REVIEW_PORT=8080 cover-review      # changer le port
+COVER_REVIEW_NO_BROWSER=1 cover-review   # ne pas ouvrir le navigateur
+```
 
 Au premier lancement, renseigner le chemin de la bibliothèque musicale et la résolution minimale, puis lancer le scan.
 
 ## Mise à jour
 
-Décompresser la nouvelle archive par-dessus le dossier existant, puis relancer :
+Avec pipx :
 
 ```bash
-unzip -o cover-review.zip
+pipx reinstall cover-review
+```
+
+Depuis les sources :
+
+```bash
 cd cover-review
+git pull
 ./run.sh
 ```
+
+Si les dépendances ont changé, elles sont réinstallées automatiquement au lancement.
 
 La base et les réglages sont conservés dans le dossier de données standard de l’utilisateur :
 
@@ -119,10 +183,13 @@ La recherche peut utiliser :
 - Cover Art Archive pour les pochettes associées aux éditions MusicBrainz ;
 - TheAudioDB comme source complémentaire ;
 - fanart.tv pour les pochettes liées à un identifiant MusicBrainz Release Group.
+- Bandcamp en recours facultatif, seulement si les autres sources n’ont rien trouvé et si un résultat d’album unique correspond aux métadonnées.
 
 fanart.tv nécessite une clé API de projet. Une clé personnelle `client_key` peut être ajoutée facultativement. Les clés sont enregistrées uniquement dans la base locale de l’utilisateur et ne doivent jamais être commitées dans le dépôt.
 
-Une image locale ou une URL directe peut également être utilisée.
+Une image locale, une URL directe ou une page de sortie Bandcamp peut également être utilisée.
+
+La recherche Bandcamp manuelle se lance depuis la vue individuelle avec le bouton **Bandcamp**. Le recours automatique peut être activé séparément dans les réglages.
 
 ## Données créées
 
@@ -137,3 +204,31 @@ Les sauvegardes sont placées dans les dossiers d’albums, par exemple :
 .cover-review-backups/20260720-143000-cover.jpg
 .cover-review-backups/20260720-143000-000000-embedded/
 ```
+
+## Fournisseurs tiers
+
+Album artwork may be provided by [fanart.tv](https://fanart.tv/).
+Users must configure their own fanart.tv API key in the application settings.
+
+## Licence
+
+Cover Review est distribué sous licence MIT. Voir [LICENSE](LICENSE).
+
+
+## Diagnostic Bandcamp
+
+Cover Review écrit un journal local dans le dossier de données de l’application :
+
+```text
+~/.local/share/cover-review/cover-review.log
+```
+
+Pour suivre les requêtes Bandcamp en temps réel :
+
+```bash
+tail -f ~/.local/share/cover-review/cover-review.log
+```
+
+Le journal indique les URL directes essayées, le code HTTP, la présence éventuelle
+d’une page de protection JavaScript, les métadonnées extraites et la raison d’un rejet.
+Les clés API ne sont pas écrites dans ce journal.

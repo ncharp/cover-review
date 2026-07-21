@@ -22,6 +22,8 @@ const state = {
   backgroundTimer: null,
   batchApplyTimer: null,
   lastBackgroundProcessed: -1,
+  bandcampSearchUrl: "",
+  showRejectedCandidates: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -102,6 +104,7 @@ async function loadSettings() {
   el("sourceMusicBrainz").checked = settings.source_musicbrainz !== "0";
   el("sourceTheAudioDB").checked = settings.source_theaudiodb !== "0";
   el("sourceFanart").checked = settings.source_fanart === "1";
+  el("sourceBandcamp").checked = settings.source_bandcamp === "1";
   el("fanartApiKey").value = settings.fanart_api_key || "";
   el("fanartClientKey").value = settings.fanart_client_key || "";
   if (!settings.library_root) {
@@ -130,6 +133,7 @@ async function saveSettings(event) {
         source_musicbrainz: el("sourceMusicBrainz").checked,
         source_theaudiodb: el("sourceTheAudioDB").checked,
         source_fanart: el("sourceFanart").checked,
+        source_bandcamp: el("sourceBandcamp").checked,
         fanart_api_key: el("fanartApiKey").value.trim(),
         fanart_client_key: el("fanartClientKey").value.trim(),
       }),
@@ -286,6 +290,7 @@ function clearCandidates() {
   state.dimensionQueue = [];
   state.activeDimensionChecks = 0;
   state.searchPartial = false;
+  state.showRejectedCandidates = false;
 }
 
 async function searchCandidates(refresh) {
@@ -299,6 +304,7 @@ async function searchCandidates(refresh) {
   state.candidateSearchController = controller;
 
   clearCandidates();
+  el("candidateLoadingText").textContent = "Recherche dans les sources activées";
   el("candidateLoading").classList.remove("hidden");
 
   try {
@@ -323,8 +329,71 @@ async function searchCandidates(refresh) {
 }
 
 
+function showBandcampEmpty(searchUrl) {
+  const notice = el("candidateMessage");
+  notice.replaceChildren();
+  notice.className = "notice";
+  notice.append(document.createTextNode("Aucun résultat Bandcamp exploitable. "));
+  if (searchUrl) {
+    const link = document.createElement("a");
+    link.href = searchUrl;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.textContent = "Ouvrir la recherche sur Bandcamp";
+    notice.append(link);
+  }
+}
+
+async function searchBandcampCandidates() {
+  const album = state.currentAlbum;
+  if (!album) return;
+  const artist = el("searchArtist").value.trim();
+  const title = el("searchAlbum").value.trim();
+  const button = el("bandcampSearchButton");
+
+  if (state.candidateSearchController) state.candidateSearchController.abort();
+  const controller = new AbortController();
+  state.candidateSearchController = controller;
+
+  clearCandidates();
+  setBusy(button, true, "Bandcamp…");
+  el("candidateLoadingText").textContent = "Recherche manuelle sur Bandcamp";
+  el("candidateLoading").classList.remove("hidden");
+
+  try {
+    const params = new URLSearchParams({ artist, album: title });
+    const result = await api(`/api/albums/${album.id}/bandcamp-candidates?${params}`, { signal: controller.signal });
+    if (controller.signal.aborted || !state.currentAlbum || state.currentAlbum.id !== album.id) return;
+    state.bandcampSearchUrl = result.search_url || "";
+    state.candidates = result.candidates || [];
+    state.searchPartial = false;
+    if (state.candidates.length === 0) {
+      showBandcampEmpty(state.bandcampSearchUrl);
+      return;
+    }
+    renderCandidates();
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    const notice = el("candidateMessage");
+    notice.textContent = error.message;
+    notice.className = "notice error";
+  } finally {
+    if (state.candidateSearchController === controller) {
+      state.candidateSearchController = null;
+      el("candidateLoading").classList.add("hidden");
+    }
+    setBusy(button, false);
+  }
+}
+
+
 function eligibleCandidates() {
   return state.candidates.filter((candidate) => candidate.eligible === true);
+}
+
+function selectableCandidate(candidate) {
+  return candidate?.dimensionChecked === true
+    && (candidate.eligible === true || state.showRejectedCandidates);
 }
 
 function clearCandidateSelection(candidate = null) {
@@ -345,17 +414,47 @@ function renumberEligibleCandidates() {
   });
 }
 
+function setRejectedCandidatesVisible(visible) {
+  state.showRejectedCandidates = visible;
+  document.querySelectorAll(".candidate-card.rejected").forEach((card) => {
+    card.classList.toggle("filtered-hidden", !visible);
+  });
+  if (!visible && state.selectedCandidate?.eligible !== true) {
+    clearCandidateSelection();
+  }
+  updateCandidateFilterNotice();
+}
+
+function appendRejectedToggle(notice, count) {
+  if (count <= 0) return;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "button secondary compact";
+  button.textContent = state.showRejectedCandidates
+    ? "Masquer les propositions sous le minimum"
+    : `Afficher ${count} proposition${count > 1 ? "s" : ""} quand même`;
+  button.addEventListener("click", () => {
+    setRejectedCandidatesVisible(!state.showRejectedCandidates);
+  });
+  notice.append(button);
+}
+
 function updateCandidateFilterNotice() {
   const notice = el("candidateMessage");
   const checks = state.candidateChecks;
   const minimum = `${state.minSize} × ${state.minSize} px`;
+  const rejectedCount = checks.filtered + checks.failed;
   const partialSuffix = state.searchPartial
     ? " La recherche réseau est partielle ; relance Recherche pour compléter les résultats."
     : "";
 
+  notice.replaceChildren();
+  notice.className = "notice";
+
+  const text = document.createElement("span");
   if (checks.completed < checks.total) {
-    notice.textContent = `Contrôle des dimensions : ${checks.completed} / ${checks.total}`;
-    notice.className = "notice";
+    text.textContent = `Contrôle des dimensions : ${checks.completed} / ${checks.total}`;
+    notice.append(text);
     return;
   }
 
@@ -363,18 +462,23 @@ function updateCandidateFilterNotice() {
     const details = [];
     if (checks.filtered) details.push(`${checks.filtered} trop petite${checks.filtered > 1 ? "s" : ""}`);
     if (checks.failed) details.push(`${checks.failed} non vérifiable${checks.failed > 1 ? "s" : ""}`);
-    notice.textContent = `Aucune proposition n’atteint le minimum de ${minimum}${details.length ? ` (${details.join(", ")})` : ""}. Modifie la recherche ou utilise une image manuelle.${partialSuffix}`;
-    notice.className = "notice";
+    text.textContent = state.showRejectedCandidates
+      ? `${rejectedCount} proposition${rejectedCount > 1 ? "s" : ""} sous le minimum ou non vérifiable${rejectedCount > 1 ? "s" : ""} affichée${rejectedCount > 1 ? "s" : ""}. Tu peux en sélectionner une malgré l’avertissement.${partialSuffix}`
+      : `Aucune proposition n’atteint le minimum de ${minimum}${details.length ? ` (${details.join(", ")})` : ""}.${partialSuffix}`;
+    notice.append(text);
+    appendRejectedToggle(notice, rejectedCount);
     return;
   }
 
-  if (checks.filtered || checks.failed) {
-    const hidden = checks.filtered + checks.failed;
-    notice.textContent = `${checks.accepted} proposition${checks.accepted > 1 ? "s" : ""} conforme${checks.accepted > 1 ? "s" : ""}. ${hidden} image${hidden > 1 ? "s" : ""} sous le minimum ou non vérifiable${hidden > 1 ? "s" : ""} masquée${hidden > 1 ? "s" : ""}.${partialSuffix}`;
-    notice.className = "notice";
+  if (rejectedCount) {
+    text.textContent = state.showRejectedCandidates
+      ? `${checks.accepted} proposition${checks.accepted > 1 ? "s" : ""} conforme${checks.accepted > 1 ? "s" : ""} et ${rejectedCount} sous le minimum ou non vérifiable${rejectedCount > 1 ? "s" : ""} affichée${rejectedCount > 1 ? "s" : ""}.${partialSuffix}`
+      : `${checks.accepted} proposition${checks.accepted > 1 ? "s" : ""} conforme${checks.accepted > 1 ? "s" : ""}. ${rejectedCount} image${rejectedCount > 1 ? "s" : ""} sous le minimum ou non vérifiable${rejectedCount > 1 ? "s" : ""} masquée${rejectedCount > 1 ? "s" : ""}.${partialSuffix}`;
+    notice.append(text);
+    appendRejectedToggle(notice, rejectedCount);
   } else {
-    notice.textContent = `${checks.accepted} proposition${checks.accepted > 1 ? "s" : ""} conforme${checks.accepted > 1 ? "s" : ""} trouvée${checks.accepted > 1 ? "s" : ""}.${partialSuffix}`;
-    notice.className = "notice";
+    text.textContent = `${checks.accepted} proposition${checks.accepted > 1 ? "s" : ""} conforme${checks.accepted > 1 ? "s" : ""} trouvée${checks.accepted > 1 ? "s" : ""}.${partialSuffix}`;
+    notice.append(text);
   }
 }
 
@@ -422,23 +526,31 @@ function completeCandidateCheck(candidate, card, accepted, failed = false) {
   if (candidate.dimensionChecked) return;
   candidate.dimensionChecked = true;
   candidate.eligible = accepted;
+  candidate.dimensionFailed = failed;
   state.candidateChecks.completed += 1;
 
   card.classList.remove("checking");
   if (accepted) {
     state.candidateChecks.accepted += 1;
     card.classList.add("eligible");
+    if (!state.selectedCandidate) selectCandidate(candidate);
   } else {
     if (failed) state.candidateChecks.failed += 1;
     else state.candidateChecks.filtered += 1;
+    candidate.rejectionReason = failed
+      ? "Dimensions non vérifiables"
+      : `Sous le minimum de ${state.minSize} × ${state.minSize} px`;
+    card.classList.add("rejected");
+    card.classList.toggle("filtered-hidden", !state.showRejectedCandidates);
+
+    const warning = card.querySelector(".candidate-warning");
+    if (warning) warning.textContent = candidate.rejectionReason;
     clearCandidateSelection(candidate);
-    card.remove();
   }
 
   renumberEligibleCandidates();
   updateCandidateFilterNotice();
 }
-
 function renderCandidates() {
   const grid = el("candidateGrid");
   grid.replaceChildren();
@@ -470,10 +582,10 @@ function renderCandidates() {
     card.tabIndex = 0;
     card.setAttribute("role", "button");
     card.addEventListener("click", () => {
-      if (candidate.eligible) selectCandidate(candidate);
+      if (selectableCandidate(candidate)) selectCandidate(candidate);
     });
     card.addEventListener("keydown", (event) => {
-      if ((event.key === "Enter" || event.key === " ") && candidate.eligible) {
+      if ((event.key === "Enter" || event.key === " ") && selectableCandidate(candidate)) {
         event.preventDefault();
         selectCandidate(candidate);
       }
@@ -493,9 +605,12 @@ function renderCandidates() {
     dimensions.className = "candidate-dimensions loading";
     dimensions.textContent = "Vérification…";
 
+    const warning = document.createElement("span");
+    warning.className = "candidate-warning";
+
     img.addEventListener("dblclick", (event) => {
       event.stopPropagation();
-      if (candidate.eligible) openImageDialog(candidate);
+      if (selectableCandidate(candidate)) openImageDialog(candidate);
     });
 
     const title = document.createElement("strong");
@@ -523,7 +638,7 @@ function renderCandidates() {
     mb.addEventListener("click", (event) => event.stopPropagation());
     links.append(zoom, mb);
 
-    card.append(number, img, dimensions, title, artist, meta, links);
+    card.append(number, img, dimensions, warning, title, artist, meta, links);
     grid.append(card);
     if (candidate.width && candidate.height) {
       dimensions.textContent = `${candidate.width} × ${candidate.height} px`;
@@ -560,7 +675,7 @@ function updateSelectedDetails(candidate) {
 }
 
 function selectCandidate(candidate) {
-  if (!candidate?.eligible) return;
+  if (!selectableCandidate(candidate)) return;
   state.selectedCandidate = candidate;
   document.querySelectorAll(".candidate-card").forEach((card) => {
     card.classList.toggle("selected", card.dataset.candidateId === candidate.id);
@@ -580,28 +695,35 @@ async function approveSelected() {
     await approveUrl(
       candidate.download_url,
       `${candidate.source} : ${candidate.source_type}`,
-      false,
+      candidate.eligible !== true,
       candidate.original_url || "",
+      candidate.source_url || "",
     );
   } finally {
     setBusy(button, false);
   }
 }
 
-async function approveUrl(url, source, allowSmall, fallbackUrl = "") {
+async function approveUrl(url, source, allowSmall, fallbackUrl = "", sourceUrl = "") {
   const album = state.currentAlbum;
   if (!album) return;
   try {
     const result = await api(`/api/albums/${album.id}/approve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, fallback_url: fallbackUrl, source, allow_small: allowSmall }),
+      body: JSON.stringify({
+        url,
+        fallback_url: fallbackUrl,
+        source_url: sourceUrl,
+        source,
+        allow_small: allowSmall,
+      }),
     });
     showToast(formatWriteResult(result), "success");
     await afterAction(album.id);
   } catch (error) {
     if (!allowSmall && error.message.includes("moins que le minimum") && window.confirm(`${error.message}\n\nL’utiliser quand même ?`)) {
-      return approveUrl(url, source, true, fallbackUrl);
+      return approveUrl(url, source, true, fallbackUrl, sourceUrl);
     }
     showToast(error.message, "error");
   }
@@ -667,7 +789,7 @@ async function useManualUrl(event) {
   const button = event.submitter;
   setBusy(button, true, "Téléchargement");
   try {
-    await approveUrl(url, "URL manuelle", false);
+    await approveUrl(url, "URL manuelle", false, "", url);
     el("manualUrl").value = "";
   } finally {
     setBusy(button, false);
@@ -1111,6 +1233,7 @@ async function init() {
     searchCandidates(true);
   });
   el("approveButton").addEventListener("click", approveSelected);
+  el("bandcampSearchButton").addEventListener("click", searchBandcampCandidates);
   el("skipButton").addEventListener("click", skipOrRestore);
   el("undoButton").addEventListener("click", undoCurrent);
   el("urlForm").addEventListener("submit", useManualUrl);
