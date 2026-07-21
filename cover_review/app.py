@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import sqlite3
-import sys
 import threading
 import time
 import unicodedata
@@ -36,14 +35,7 @@ APP_NAME = "Cover Review"
 APP_VERSION = "1.5.4"
 SEARCH_CACHE_VERSION = 7
 BATCH_RESULT_VERSION = 5
-def _default_data_dir() -> Path:
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-        return base / "cover-review"
-    return Path.home() / ".local" / "share" / "cover-review"
-
-
-DATA_DIR = Path(os.environ.get("COVER_REVIEW_DATA_DIR", str(_default_data_dir()))).expanduser()
+DATA_DIR = Path(os.environ.get("COVER_REVIEW_DATA_DIR", str(Path.home() / ".local" / "share" / "cover-review"))).expanduser()
 CACHE_DIR = DATA_DIR / "cache"
 CURRENT_CACHE_DIR = CACHE_DIR / "current"
 DB_PATH = DATA_DIR / "cover-review.sqlite3"
@@ -83,16 +75,7 @@ BANDCAMP_USER_AGENT = (
     "Chrome/149.0.0.0 Safari/537.36"
 )
 
-# Dans un exécutable PyInstaller, templates et static sont extraits sous sys._MEIPASS.
-if getattr(sys, "frozen", False):
-    _bundle_dir = Path(getattr(sys, "_MEIPASS", ".")) / "cover_review"
-    app = Flask(
-        __name__,
-        template_folder=str(_bundle_dir / "templates"),
-        static_folder=str(_bundle_dir / "static"),
-    )
-else:
-    app = Flask(__name__)
+app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_DOWNLOAD_BYTES
 
 SCAN_STATE: dict[str, Any] = {

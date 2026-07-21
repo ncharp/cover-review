@@ -77,15 +77,9 @@ Il reste conseillé de disposer d’une sauvegarde normale de la bibliothèque a
 
 ## Installation et lancement
 
-### Exécutable prêt à l'emploi (aucune installation)
+Python 3.9 ou plus récent est requis.
 
-Des exécutables Windows, Linux et macOS sont construits automatiquement à chaque release et proposés sur la [page Releases](https://github.com/ncharp/cover-review/releases). Télécharger le fichier correspondant au système puis le lancer : le navigateur s'ouvre automatiquement sur l'interface.
-
-Les binaires ne sont pas signés. Windows SmartScreen ou macOS Gatekeeper peuvent afficher un avertissement au premier lancement.
-
-Les méthodes suivantes demandent Python 3.9 ou plus récent.
-
-### Avec pipx
+### Avec pipx (recommandé)
 
 ```bash
 pipx install git+https://github.com/ncharp/cover-review.git
